@@ -1,9 +1,10 @@
 package show_client
 
 import (
+	"encoding/json"
+	"fmt"
 	"strconv"
 	"strings"
-	"syscall/js"
 
 	log "github.com/golang/glog"
 	sdc "github.com/sonic-net/sonic-gnmi/sonic_data_client"
@@ -62,7 +63,7 @@ func contains(arr []string, val string) bool {
 	return false
 }
 
-func parseNDPOutput(output string) NeighborTable {
+func parseNDPOutput(output string, intf string) NeighborTable {
 	table := NeighborTable{}
 
 	if strings.TrimSpace(output) == "" {
@@ -86,6 +87,11 @@ func parseNDPOutput(output string) NeighborTable {
 			if fields[i] == "lladdr" && i+1 < len(fields) {
 				mac = fields[i+1]
 			}
+		}
+
+		// When iface is explicitly specified, the kernel output omits the 'dev <iface>' field.
+		if iface == "" && intf != "" {
+			iface = intf
 		}
 
 		// Derive VLAN from interface name if it starts with "Vlan"
@@ -115,19 +121,86 @@ func parseNDPOutput(output string) NeighborTable {
 	return table
 }
 
-func getNDP(options sdc.OptionMap) ([]byte, error) {
-	intf, _ := options["interface"].String()
-	ip, _ := options["ipaddress"].String()
-
+func getBridgePortMap() (map[string]string, error) {
 	queries := [][]string{
-		{"ASIC_DB", "ASIC_STATE", "SAI_OBJECT_TYPE_BRIDGE_PORT"},
+		{"ASIC_DB", "ASIC_STATE:SAI_OBJECT_TYPE_BRIDGE_PORT:*"},
 	}
 	brPortStr, err := GetMapFromQueries(queries)
 	if err != nil {
 		log.Errorf("Failed to get SAI_OBJECT_TYPE_BRIDGE_PORT list from ASIC_DB: %v", err)
 		return nil, err
 	}
-	log.Infof("data from query: %v", brPortStr)
+	log.Infof("SAI_OBJECT_TYPE_BRIDGE_PORT data from query: %v", brPortStr)
+
+	ifBrOidMap := make(map[string]string)
+	oidPrefix := len("oid:0x")
+
+	for key, val := range brPortStr {
+		parts := strings.SplitN(key, ":", 2)
+		if len(parts) < 2 {
+			continue
+		}
+		bridgePortOid := parts[1][oidPrefix:] // strip "oid:0x"
+
+		attrs, ok := val.(map[string]string)
+		if !ok {
+			// sometimes it might be map[string]interface{}, so try that
+			if m, ok2 := val.(map[string]interface{}); ok2 {
+				attrs = make(map[string]string)
+				for k, v := range m {
+					attrs[k] = fmt.Sprintf("%v", v)
+				}
+			} else {
+				log.Warningf("Unexpected type for attrs: %T", val)
+				continue
+			}
+		}
+		// attrs is map[string]string
+		portIdRaw, ok := attrs["SAI_BRIDGE_PORT_ATTR_PORT_ID"]
+		if !ok {
+			continue
+		}
+		portId := portIdRaw[oidPrefix:] // strip "oid:0x"
+		ifBrOidMap[bridgePortOid] = portId
+	}
+	return ifBrOidMap, nil
+}
+
+func fetchFDBData() (map[string]interface{}, error) {
+	queries := [][]string{
+		{"ASIC_DB", "ASIC_STATE:SAI_OBJECT_TYPE_FDB_ENTRY:*"},
+	}
+	brPortStr, err := GetMapFromQueries(queries)
+	if err != nil {
+		log.Errorf("Failed to get SAI_OBJECT_TYPE_FDB_ENTRY list from ASIC_DB: %v", err)
+		return nil, err
+	}
+	log.Infof("SAI_OBJECT_TYPE_FDB_ENTRY data from query: %v", brPortStr)
+	return brPortStr, nil
+}
+
+func getNDP(options sdc.OptionMap) ([]byte, error) {
+	intf, _ := options["interface"].String()
+	ip, _ := options["ipaddress"].String()
+
+	queries := [][]string{
+		{"ASIC_DB", "ASIC_STATE:SAI_OBJECT_TYPE_FDB_ENTRY:*"},
+	}
+	brPortStr, err := GetMapFromQueries(queries)
+	if err != nil {
+		log.Errorf("Failed to get SAI_OBJECT_TYPE_FDB_ENTRY list from ASIC_DB: %v", err)
+		return nil, err
+	}
+	log.Infof("fdb_entry_1:data from query: %v", brPortStr)
+	queries = [][]string{
+		{"ASIC_DB", "ASIC_STATE", "SAI_OBJECT_TYPE_FDB_ENTRY:*"},
+	}
+	brPortStr, err = GetMapFromQueries(queries)
+	if err != nil {
+		log.Errorf("Failed to get SAI_OBJECT_TYPE_FDB_ENTRY list from ASIC_DB: %v", err)
+		return nil, err
+	}
+	log.Infof("fdb_entry_2:data from query: %v", brPortStr)
 	cmd := baseNdpCmd
 	if ip != "" {
 		cmd += " " + ip
@@ -150,10 +223,10 @@ func getNDP(options sdc.OptionMap) ([]byte, error) {
 
 	log.Infof("ndp output: %s", cmdOutput)
 	// Parse the output
-	table := parseNDPOutput(cmdOutput)
+	table := parseNDPOutput(cmdOutput, intf)
 	log.Infof("parsed table: %v", table)
 	// Convert to JSON
-	jsonData, err := js.Marshal(table)
+	jsonData, err := json.Marshal(table)
 	if err != nil {
 		return nil, err
 	}
