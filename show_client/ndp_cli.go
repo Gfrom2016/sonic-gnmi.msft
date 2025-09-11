@@ -215,6 +215,55 @@ func getInterfaceOidMap() (map[string]string, error) {
 	return ifOidMap, nil
 }
 
+func buildBvidToVlanMap() (map[string]string, error) {
+	queries := [][]string{
+		{"ASIC_DB", "ASIC_STATE:SAI_OBJECT_TYPE_VLAN:*"},
+	}
+
+	vlanData, err := GetMapFromQueries(queries)
+	if err != nil {
+		log.Errorf("Failed to get VLAN data: %v", err)
+		return nil, err
+	}
+
+	const prefix = "SAI_OBJECT_TYPE_VLAN:"
+	result := make(map[string]string)
+
+	for key, val := range vlanData {
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+
+		bvid := strings.TrimPrefix(key, prefix) // "oid:..."
+
+		ent, ok := val.(map[string]interface{})
+		if !ok {
+			log.Warningf("Unexpected format for VLAN entry %s: %#v", key, val)
+			continue
+		}
+
+		if vlanIDRaw, ok := ent["SAI_VLAN_ATTR_VLAN_ID"]; ok {
+			if vlanIDStr, ok := vlanIDRaw.(string); ok {
+				result[bvid] = vlanIDStr
+			} else {
+				log.Warningf("Invalid VLAN ID type for BVID %s: %#v", bvid, vlanIDRaw)
+			}
+		} else {
+			log.Warningf("VLAN ID not found for BVID %s", bvid)
+		}
+	}
+
+	return result, nil
+}
+
+func getVlanIDFromBvid(bvid string, bvidMap map[string]string) (string, error) {
+	if vlanID, ok := bvidMap[bvid]; ok {
+		return vlanID, nil
+	}
+	return "", fmt.Errorf("BVID %s not found in VLAN map", bvid)
+}
+
+/*
 func getVlanIDFromBvid(bvid string) (string, error) {
 	queries := [][]string{
 		{"ASIC_DB", "ASIC_STATE:SAI_OBJECT_TYPE_VLAN:*"},
@@ -263,6 +312,7 @@ func getVlanIDFromBvid(bvid string) (string, error) {
 	log.Warningf("BVID %s not found in VLAN data", bvid)
 	return "", fmt.Errorf("BVID %s not found", bvid)
 }
+*/
 
 func getBridgePortMap() (map[string]string, error) {
 	queries := [][]string{
@@ -339,6 +389,11 @@ func fetchFdbData() ([]BridgeMacEntry, error) {
 		return nil, fmt.Errorf("bridge/port maps not initialized")
 	}
 
+	bvidMap, err := buildBvidToVlanMap()
+	if err != nil {
+		log.Fatalf("Failed to build BVID map: %v", err)
+		return nil, err
+	}
 	oidPrefix := len("oid:0x")
 	bridgeMacList := []BridgeMacEntry{}
 
@@ -384,7 +439,7 @@ func fetchFdbData() ([]BridgeMacEntry, error) {
 		if v, ok := fdb["vlan"]; ok {
 			vlanIDStr = v
 		} else if bvid, ok := fdb["bvid"]; ok {
-			vlanIDStr, err = getVlanIDFromBvid(bvid)
+			vlanIDStr, err = getVlanIDFromBvid(bvid, bvidMap)
 			if err != nil || vlanIDStr == "" {
 				log.Warningf("Failed to get VLAN ID from BVID %s: %v", bvid, err)
 				vlanIDStr = bvid // fallback
